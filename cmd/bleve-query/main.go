@@ -16,9 +16,14 @@ import (
 	"sync/atomic"
 	"time"
 
+	"golang.org/x/net/context"
+
 	"github.com/blevesearch/bleve"
 	_ "github.com/blevesearch/bleve/config"
+	"github.com/blevesearch/bleve/search"
 	"github.com/blevesearch/bleve/search/query"
+
+	_ "github.com/couchbase/fuego"
 )
 
 var target = flag.String("index", "bench.bleve", "index filename")
@@ -37,6 +42,7 @@ var statsWriter = os.Stdout
 var queriesStarted uint64
 var queriesFinished uint64
 var lastQueriesFinished uint64
+var resultsTotal uint64
 var timeStart time.Time
 var timeLast time.Time
 
@@ -143,8 +149,25 @@ func main() {
 	index.Close()
 }
 
-func queryClient(index bleve.Index, queries []query.Query, closeChan chan struct{}) {
+type ctxReq struct {
+	ctx context.Context
+	req *bleve.SearchRequest
+}
 
+var poolCtxReq = sync.Pool{
+	New: func() interface{} {
+		ctx := context.Background()
+		dmp := search.NewDocumentMatchPool(12, 1)
+		ctx = search.WithDocumentMatchPool(ctx, dmp)
+
+		return &ctxReq{
+			ctx: ctx,
+			req: bleve.NewSearchRequest(nil),
+		}
+	},
+}
+
+func queryClient(index bleve.Index, queries []query.Query, closeChan chan struct{}) {
 	// query client first creates its own unique order to run the queries
 	perm := rand.Perm(len(queries))
 	i := 0
@@ -158,11 +181,17 @@ func queryClient(index bleve.Index, queries []query.Query, closeChan chan struct
 			p := perm[qi]
 			q := queries[p]
 			atomic.AddUint64(&queriesStarted, 1)
-			req := bleve.NewSearchRequest(q)
-			_, err := index.Search(req)
+			ctxReq := poolCtxReq.Get().(*ctxReq)
+			ctxReq.req.Query = q
+			res, err := index.SearchInContext(ctxReq.ctx, ctxReq.req)
 			if err != nil {
 				log.Fatal(err)
 			}
+			if res.Status.Failed > 0 {
+				log.Fatal(res.Status)
+			}
+			poolCtxReq.Put(ctxReq)
+			atomic.AddUint64(&resultsTotal, res.Total)
 			atomic.AddUint64(&queriesFinished, 1)
 		}
 	}
@@ -173,6 +202,9 @@ var outputFields = []string{
 	"queries_finished",
 	"avg_queries_per_second",
 	"queries_per_second",
+	"total_results",
+	"avg_results_per_query",
+	"results_per_second",
 }
 
 func printHeader() {
@@ -183,6 +215,7 @@ func printLine() {
 	// get
 	timeNow := time.Now()
 	nowQueriesFinished := atomic.LoadUint64(&queriesFinished)
+	nowResultsTotal := atomic.LoadUint64(&resultsTotal)
 
 	// calculate
 	curQueriesFinished := nowQueriesFinished - lastQueriesFinished
@@ -194,8 +227,14 @@ func printLine() {
 	curSeconds := float64(curTimeTaken) / float64(time.Second)
 
 	dateNow := timeNow.Format(time.RFC3339)
-	fmt.Fprintf(statsWriter, "%s,%d,%f,%f\n", dateNow, nowQueriesFinished,
-		float64(nowQueriesFinished)/cumSeconds, float64(curQueriesFinished)/curSeconds)
+	fmt.Fprintf(statsWriter, "%s,%d,%f,%f\t\t%d,%f,%f\n", dateNow,
+		nowQueriesFinished,
+		float64(nowQueriesFinished)/cumSeconds,
+		float64(curQueriesFinished)/curSeconds,
+		nowResultsTotal,
+		float64(nowResultsTotal)/float64(nowQueriesFinished),
+		float64(nowResultsTotal)/curSeconds,
+	)
 
 	timeLast = timeNow
 	lastQueriesFinished = nowQueriesFinished

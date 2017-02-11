@@ -25,6 +25,8 @@ import (
 	_ "github.com/blevesearch/bleve/config"
 	_ "github.com/blevesearch/bleve/index/store/metrics"
 	_ "github.com/blevesearch/bleve/index/store/null"
+
+	_ "github.com/couchbase/fuego"
 )
 
 var config = flag.String("config", "", "configuration file to use")
